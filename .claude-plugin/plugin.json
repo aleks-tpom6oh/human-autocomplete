@@ -1,0 +1,26 @@
+{
+  "name": "hand-code",
+  "version": "0.1.0",
+  "description": "Now and then, your agent hands you one real function from the task at hand to write yourself: signature, brief, failing tests. Pick it up within 20 minutes or it writes it for you.",
+  "author": {
+    "name": "Alexey Verein",
+    "url": "https://github.com/aleks-tpom6oh"
+  },
+  "homepage": "https://github.com/aleks-tpom6oh/hand-code",
+  "repository": "https://github.com/aleks-tpom6oh/hand-code",
+  "license": "MIT",
+  "keywords": ["practice", "coding", "kata", "focus", "skills"],
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/hand-code/scripts/handcode\" hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+r"""handcode: coordinates hand-code requests across every Claude Code session on this machine.
+
+One request at a time, and a cooldown between requests, enforced with a file lock in
+$HAND_CODE_HOME (default ~/.claude/hand-code). Agents call: check, claim, post, wait,
+reopen, close, release. The user calls: status, show, open, accept, skip, done, extend,
+test, pause, off, on, stats. `hook` is for a UserPromptSubmit hook.
+
+Lifecycle: drafting -> pending -> accepted -> done
+                              \-> expired (no pickup in time)   \-> abandoned (over work time)
+                              \-> skipped (user passed)
+A pending request becomes accepted as soon as the stub file changes on disk, and done
+as soon as its HAND-CODE(<id>) marker line disappears.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("HAND_CODE_HOME", "~/.claude/hand-code")).expanduser()
+STATE = HOME / "state.json"
+HISTORY = HOME / "history.jsonl"
+CONFIG = HOME / "config.json"
+LOCK = HOME / ".lock"
+SELF = Path(__file__).resolve()
+
+DEFAULTS = {
+    "cooldown_min": 60,  # quiet time after a request ends before the next one
+    "accept_min": 20,  # time the user has to pick a request up
+    "work_min": 90,  # time the user has to finish once picked up
+    "draft_min": 15,  # a claim that is never posted frees itself after this
+    "notify": True,
+    "dialog": True,  # also show a Take it / Skip / Later pop-up that stays until answered
+    "sound": "Glass",
+    "editor": None,  # e.g. "cursor", "code", "zed"; default tries those in order
+}
+ENV_OVERRIDES = {
+    "cooldown_min": "HAND_CODE_COOLDOWN_MIN",
+    "accept_min": "HAND_CODE_ACCEPT_MIN",
+    "work_min": "HAND_CODE_WORK_MIN",
+    "draft_min": "HAND_CODE_DRAFT_MIN",
+}
+ACTIVE = ("drafting", "pending", "accepted")
+LATER_MIN = 10  # how long the pop-up's Later button snoozes
+TERMINAL = ("done", "expired", "skipped", "abandoned", "withdrawn", "lost")
+EXTRA_PATH = ["/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local/bin")]
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONFIG.exists():
+        cfg.update(json.loads(CONFIG.read_text()))
+    for key, var in ENV_OVERRIDES.items():
+        if var in os.environ:
+            cfg[key] = float(os.environ[var])
+    if os.environ.get("HAND_CODE_NO_NOTIFY"):
+        cfg["notify"] = False
+    return cfg
+
+
+def marker(rid):
+    return f"HAND-CODE({rid})"
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def digest(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def fmt_min(seconds):
+    return f"{max(0, round(seconds / 60))} min"
+
+
+def append_history(entry):
+    with open(HISTORY, "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def end(state, cur, status, now):
+    cur["status"] = status
+    cur["ended_at"] = now
+    if status != "withdrawn" or cur.get("posted_at"):
+        state["last_ended_at"] = now
+    append_history({k: cur.get(k) for k in (
+        "id", "title", "symbol", "file", "project", "status", "posted_at",
+        "accepted_at", "ended_at", "estimate", "reopens")})
+
+
+def refresh(state, cfg, now):
+    """Apply time- and file-based transitions. Returns events worth notifying about."""
+    events = []
+    if state.get("paused_until") and now >= state["paused_until"]:
+        state["paused_until"] = None
+    cur = state.get("current")
+    if not cur or cur["status"] not in ACTIVE:
+        return events
+    extra = cur.get("extra_min", 0) * 60
+    if cur["status"] == "drafting":
+        if now - cur["claimed_at"] > cfg["draft_min"] * 60 + extra:
+            state["current"] = None
+        return events
+    text = read_text(cur["file"])
+    if text is None:
+        end(state, cur, "lost", now)
+    elif marker(cur["id"]) not in text:
+        cur["accepted_at"] = cur.get("accepted_at") or cur["posted_at"]
+        end(state, cur, "done", now)
+    elif cur["status"] == "pending":
+        if digest(text) != cur["hash"]:
+            cur["status"] = "accepted"
+            cur["accepted_at"] = now
+            cur["accepted_by"] = "edit"
+        elif now - cur["posted_at"] > cfg["accept_min"] * 60 + extra:
+            end(state, cur, "expired", now)
+            events.append(("expired", cur))
+    elif now - cur["accepted_at"] > cfg["work_min"] * 60 + extra:
+        end(state, cur, "abandoned", now)
+        events.append(("abandoned", cur))
+    return events
+
+
+class Store:
+    """Exclusive, refreshed view of the state for the duration of a with-block."""
+
+    def __init__(self):
+        self.cfg = load_config()
+        self.now = time.time()
+
+    def __enter__(self):
+        HOME.mkdir(parents=True, exist_ok=True)
+        self.fh = open(LOCK, "a")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        self.state = json.loads(STATE.read_text()) if STATE.exists() else {}
+        self.state.setdefault("current", None)
+        self.loaded = json.dumps(self.state, sort_keys=True)
+        cur = self.state["current"]
+        self.was_pending = cur["id"] if cur and cur["status"] == "pending" else None
+        self.events = refresh(self.state, self.cfg, self.now)
+        return self
+
+    def __exit__(self, exc_type, *_):
+        if exc_type is None and json.dumps(self.state, sort_keys=True) != self.loaded:
+            tmp = STATE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.state, indent=2))
+            os.replace(tmp, STATE)
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+        cur = self.state.get("current")
+        if self.was_pending and not (cur and cur["id"] == self.was_pending and cur["status"] == "pending"):
+            clear_notification(self.cfg)  # no longer waiting on you, so "Your turn" is stale
+        for kind, cur in self.events:
+            if kind == "expired":
+                notify(self.cfg, "⏰ Hand-code expired", f"No pickup — the agent is writing {cur['symbol']} itself.")
+            elif kind == "abandoned":
+                notify(self.cfg, "⏰ Hand-code over time", f"The agent is finishing {cur['symbol']} from where you left it.")
+
+    def availability(self):
+        """(open, reason, seconds until open or None)."""
+        state, cfg, now = self.state, self.cfg, self.now
+        if state.get("off"):
+            return False, "off", None
+        if state.get("paused_until"):
+            return False, "paused", state["paused_until"] - now
+        cur = state.get("current")
+        if cur and cur["status"] in ACTIVE:
+            return False, "busy", None
+        last = state.get("last_ended_at")
+        if last and now < last + cfg["cooldown_min"] * 60:
+            return False, "cooldown", last + cfg["cooldown_min"] * 60 - now
+        return True, "open", None
+
+    def current(self, rid=None, statuses=None):
+        cur = self.state.get("current")
+        if not cur or (rid and cur["id"] != rid):
+            fail(f"no request {rid}" if rid else "no current request")
+        if statuses and cur["status"] not in statuses:
+            fail(f"{cur['id']} is {cur['status']}, expected {'/'.join(statuses)}")
+        return cur
+
+
+def fail(message):
+    print(json.dumps({"ok": False, "error": message}))
+    sys.exit(1)
+
+
+def out(obj):
+    print(json.dumps(obj, indent=2))
+
+
+def applescript_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def notify(cfg, title, message, open_id=None):
+    if not cfg["notify"]:
+        return
+    path = os.pathsep.join([os.environ.get("PATH", "")] + EXTRA_PATH)
+    try:
+        tn = shutil.which("terminal-notifier", path=path)
+        if tn:
+            cmd = [tn, "-title", title, "-message", message, "-group", "hand-code", "-sound", cfg["sound"]]
+            if open_id:
+                env = f"HAND_CODE_HOME='{HOME}' " if "HAND_CODE_HOME" in os.environ else ""
+                cmd += ["-execute", f"{env}'{sys.executable}' '{SELF}' open {open_id}"]
+            rc = subprocess.run(cmd, capture_output=True, timeout=10).returncode
+            if rc == 0:
+                return
+            app = Path(tn).resolve().parent.parent / "terminal-notifier.app"
+            if rc == 3 and app.exists():
+                # Not authorised: never asked, or reset by a macOS update. Launched through
+                # LaunchServices it can show the permission prompt, which a child process can't.
+                subprocess.run(["open", "-n", "-a", str(app), "--args"] + cmd[1:], capture_output=True, timeout=10)
+        if sys.platform == "darwin":
+            script = (f"display notification {applescript_str(message)} with title {applescript_str(title)}"
+                      f" sound name {applescript_str(cfg['sound'])}")
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, message], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def clear_notification(cfg):
+    if not cfg["notify"]:
+        return
+    tn = shutil.which("terminal-notifier", path=os.pathsep.join([os.environ.get("PATH", "")] + EXTRA_PATH))
+    if tn:
+        try:
+            subprocess.run([tn, "-remove", "hand-code"], capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+
+def git_root(path):
+    try:
+        res = subprocess.run(["git", "-C", str(Path(path).parent), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=5)
+        return res.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def summary(cur, now):
+    s = {k: cur.get(k) for k in ("id", "status", "title", "symbol", "file", "line", "test_cmd", "reopens")}
+    if cur.get("accepted_at") and cur.get("ended_at"):
+        s["minutes_taken"] = round((cur["ended_at"] - cur["accepted_at"]) / 60, 1)
+    return s
+
+
+def parse_duration(text):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([hm]?)", text.strip())
+    if not m:
+        fail(f"bad duration {text!r}; use e.g. 45m or 2h")
+    return float(m.group(1)) * (3600 if m.group(2) == "h" else 60)
+
+
+def recent_titles(n=3):
+    if not HISTORY.exists():
+        return []
+    seen = {}
+    for line in HISTORY.read_text().splitlines():
+        entry = json.loads(line)
+        if entry.get("title") and entry.get("status") != "declined":
+            seen[entry["id"]] = entry["title"]
+    return list(seen.values())[-n:]
+
+
+# --- agent-facing commands -------------------------------------------------------------
+
+def cmd_check(args):
+    with Store() as st:
+        is_open, reason, wait_s = st.availability()
+    res = {"open": is_open, "reason": reason}
+    if wait_s:
+        res["opens_in"] = fmt_min(wait_s)
+    if is_open:
+        res["recent"] = recent_titles()
+    out(res)
+
+
+def cmd_claim(args):
+    with Store() as st:
+        is_open, reason, wait_s = st.availability()
+        if not is_open and not (args.force and reason != "busy"):
+            res = {"ok": False, "reason": reason}
+            if wait_s:
+                res["opens_in"] = fmt_min(wait_s)
+            out(res)
+            sys.exit(1)
+        rid = "hc-" + secrets.token_hex(2)
+        st.state["current"] = {
+            "id": rid, "status": "drafting", "title": args.title, "claimed_at": st.now,
+            "project": Path(os.getcwd()).name, "forced": args.force, "reopens": 0,
+        }
+    out({"ok": True, "id": rid, "marker": marker(rid)})
+
+
+def cmd_post(args):
+    path = str(Path(args.file).expanduser().resolve())
+    text = read_text(path)
+    if text is None:
+        fail(f"cannot read {path}")
+    lines = [i for i, line in enumerate(text.splitlines(), 1) if marker(args.id) in line]
+    if not lines:
+        fail(f"{marker(args.id)} not found in {path}; add the marker line first")
+    with Store() as st:
+        cur = st.current(args.id, ("drafting",))
+        cur.update({
+            "status": "pending", "posted_at": st.now, "file": path, "line": lines[0],
+            "root": git_root(path) or str(Path(path).parent), "symbol": args.symbol,
+            "summary": args.summary, "test_cmd": args.test_cmd, "estimate": args.estimate,
+            "hash": digest(text),
+        })
+        accept_s = st.cfg["accept_min"] * 60
+        cfg = st.cfg
+    est = f" · ~{args.estimate} min" if args.estimate else ""
+    if not spawn_dialog(cfg, args.id):
+        notify(cfg, f"✋ Your turn: {args.symbol}", f"{args.summary}{est}. Start within {fmt_min(accept_s)}.", args.id)
+    out({"ok": True, "id": args.id, "line": lines[0], "pickup_window": fmt_min(accept_s)})
+
+
+def cmd_wait(args):
+    last = None
+    while True:
+        with Store() as st:
+            cur = st.state.get("current")
+            now = st.now
+        if not cur or cur["id"] != args.id:
+            out({"id": args.id, "status": "gone"})
+            return
+        if cur["status"] != last:
+            last = cur["status"]
+            print(f"[{time.strftime('%H:%M:%S')}] {args.id} {last}", flush=True)
+        if cur["status"] not in ACTIVE:
+            out(summary(cur, now))
+            return
+        time.sleep(args.poll)
+
+
+def cmd_reopen(args):
+    with Store() as st:
+        cur = st.current(args.id, ("done",))
+        text = read_text(cur["file"])
+        if text is None or marker(args.id) not in text:
+            fail(f"put the {marker(args.id)} line back in {cur['file']} before reopening")
+        cur.update({"status": "pending", "posted_at": st.now, "hash": digest(text),
+                    "reopens": cur.get("reopens", 0) + 1, "reopen_reason": args.reason})
+        cur.pop("ended_at", None)
+        cur.pop("accepted_at", None)
+        cfg = st.cfg
+    if not spawn_dialog(cfg, args.id):
+        notify(cfg, f"🔴 {cur['symbol']}: not quite", args.reason, args.id)
+    out({"ok": True, "id": args.id, "pickup_window": fmt_min(cfg["accept_min"] * 60)})
+
+
+def cmd_close(args):
+    with Store() as st:
+        cur = st.current(args.id)
+        if cur["status"] in ACTIVE:
+            fail(f"{args.id} is still {cur['status']}")
+        cur["result"] = args.result
+    append_history({"id": args.id, "result": args.result})
+    out({"ok": True})
+
+
+def cmd_decline(args):
+    """Record a candidate looked at and passed on, so `stats` shows why nothing was asked."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    append_history({"id": "decline-" + secrets.token_hex(2), "title": args.title, "status": "declined",
+                    "reason": args.reason, "ended_at": time.time(), "project": Path(os.getcwd()).name})
+    out({"ok": True})
+
+
+def cmd_release(args):
+    with Store() as st:
+        cur = st.current(args.id, ACTIVE)
+        if cur["status"] == "drafting":
+            st.state["current"] = None
+        else:
+            end(st.state, cur, "withdrawn", st.now)
+    out({"ok": True})
+
+
+# --- user-facing commands --------------------------------------------------------------
+
+def user_transition(args, statuses, apply, message):
+    with Store() as st:
+        cur = st.current(args.id, statuses)
+        apply(st, cur)
+    print(message.format(**cur))
+
+
+def cmd_accept(args):
+    def apply(st, cur):
+        cur.update(status="accepted", accepted_at=st.now, accepted_by="cli")
+    user_transition(args, ("pending",), apply,
+                    "Yours: {symbol} at {file}:{line}. Delete the HAND-CODE line (or run `handcode done`) when finished.")
+
+
+def cmd_skip(args):
+    user_transition(args, ("pending", "accepted"), lambda st, cur: end(st.state, cur, "skipped", st.now),
+                    "Skipped {symbol}; the agent will write it.")
+
+
+def cmd_done(args):
+    def apply(st, cur):
+        cur["accepted_at"] = cur.get("accepted_at") or cur["posted_at"]
+        end(st.state, cur, "done", st.now)
+    user_transition(args, ("pending", "accepted"), apply, "Done: {symbol}. The agent will run the tests.")
+
+
+def cmd_extend(args):
+    def apply(st, cur):
+        cur["extra_min"] = cur.get("extra_min", 0) + args.minutes
+    user_transition(args, ("pending", "accepted"), apply, f"Gave {{symbol}} {args.minutes:g} more minutes.")
+
+
+def cmd_status(args):
+    with Store() as st:
+        is_open, reason, wait_s = st.availability()
+        cur, now, cfg = st.state.get("current"), st.now, st.cfg
+    if cur and cur["status"] in ("pending", "accepted"):
+        extra = cur.get("extra_min", 0) * 60
+        if cur["status"] == "pending":
+            left = f"{fmt_min(cur['posted_at'] + cfg['accept_min'] * 60 + extra - now)} left to pick up"
+        else:
+            left = f"{fmt_min(cur['accepted_at'] + cfg['work_min'] * 60 + extra - now)} left"
+        print(f"✋ {cur['id']} {cur['status']}: {cur['symbol']} — {left}")
+        print(f"   {cur['file']}:{cur['line']}")
+        if cur.get("test_cmd"):
+            print(f"   tests: {cur['test_cmd']}")
+        return
+    if cur and cur["status"] == "drafting":
+        print(f"… an agent is preparing a request: {cur['title']}")
+        return
+    if is_open:
+        print("Slot open: the next agent with a good candidate may ask you.")
+    elif reason == "cooldown":
+        print(f"Cooling down: next request possible in {fmt_min(wait_s)}.")
+    elif reason == "paused":
+        print(f"Paused for {fmt_min(wait_s)}.")
+    else:
+        print("Off. `handcode on` to turn back on.")
+
+
+def cmd_show(args):
+    with Store() as st:
+        cur = st.current(args.id)
+    print(f"{cur['id']} [{cur['status']}] {cur.get('symbol') or cur['title']}")
+    if cur.get("summary"):
+        print(cur["summary"])
+    text = read_text(cur.get("file") or "")
+    if text:
+        start = max(0, cur["line"] - 2)
+        print(f"\n{cur['file']}:{cur['line']}\n")
+        print("\n".join(text.splitlines()[start:start + args.lines]))
+
+
+def cmd_open(args):
+    with Store() as st:
+        cur = st.current(args.id)
+        cfg = st.cfg
+    if not cur.get("file"):
+        fail(f"{cur['id']} has no file yet")
+    open_editor(cur, cfg)
+
+
+def open_editor(cur, cfg):
+    file, line, root = cur["file"], cur.get("line", 1), cur.get("root")
+    path = os.pathsep.join([os.environ.get("PATH", "")] + EXTRA_PATH)
+    preferred = os.environ.get("HAND_CODE_EDITOR") or cfg.get("editor")
+    for name in [preferred] if preferred else ["cursor", "code", "zed", "subl"]:
+        exe = shutil.which(name, path=path)
+        if not exe:
+            continue
+        base = Path(exe).name
+        if base in ("code", "cursor", "code-insiders", "windsurf"):
+            argv = [exe, root, "-g", f"{file}:{line}"] if root else [exe, "-g", f"{file}:{line}"]
+        elif base in ("zed", "subl"):
+            argv = [exe, f"{file}:{line}"]
+        else:
+            argv = [exe, file]
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    subprocess.Popen(["open", file])
+
+
+def spawn_dialog(cfg, rid):
+    """Show the pop-up from a detached process, so the agent's command returns at once.
+    Returns False when there's no pop-up, so the caller falls back to a banner."""
+    if not (cfg["notify"] and cfg["dialog"] and sys.platform == "darwin"):
+        return False
+    subprocess.Popen([sys.executable, str(SELF), "dialog", rid], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
+def pending(rid):
+    with Store() as st:
+        cur = st.state.get("current")
+        return (cur, st.cfg, st.now) if cur and cur["id"] == rid and cur["status"] == "pending" else (None, st.cfg, st.now)
+
+
+def cmd_dialog(args):
+    """Pop-up for a pending request: Take it / Skip / Later. Closes itself once the request
+    stops being pending, whether you edited the file, answered in chat, or it expired."""
+    while True:
+        cur, cfg, now = pending(args.id)
+        if not cur:
+            return
+        left = cur["posted_at"] + (cfg["accept_min"] + cur.get("extra_min", 0)) * 60 - now
+        if left < 30:
+            return
+        where = f"{Path(cur['file']).name}:{cur['line']} in {cur.get('project') or Path(cur['root']).name}"
+        est = f" · ~{cur['estimate']} min" if cur.get("estimate") else ""
+        about = f"Not quite: {cur['reopen_reason']}" if cur.get("reopen_reason") else cur["summary"]
+        text = (f"Your turn: {cur['symbol']}{est}\n\n{about}\n\n{where}\n\n"
+                f"Pick it up within {fmt_min(left)}, or the agent writes it.")
+        script = (f"activate\ndisplay dialog {applescript_str(text)} with title \"✋ Hand-code\" "
+                  f"buttons {{\"Skip\", \"Later (+{LATER_MIN} min)\", \"Take it\"}} "
+                  f"giving up after {int(left)} with icon note")
+        proc = subprocess.Popen(["osascript", "-e", script], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        while proc.poll() is None:
+            time.sleep(2)
+            if not pending(args.id)[0]:
+                proc.terminate()
+                return
+        answer = proc.stdout.read()
+        if "gave up:true" in answer or "button returned:" not in answer:
+            return
+        with Store() as st:
+            cur = st.state.get("current")
+            if not cur or cur["id"] != args.id or cur["status"] != "pending":
+                return
+            if "Take it" in answer:
+                cur.update(status="accepted", accepted_at=st.now, accepted_by="dialog")
+            elif "Skip" in answer:
+                end(st.state, cur, "skipped", st.now)
+            else:
+                cur["extra_min"] = cur.get("extra_min", 0) + LATER_MIN
+            cfg = st.cfg
+        if "Take it" in answer:
+            open_editor(cur, cfg)
+            return
+        if "Skip" in answer:
+            return
+        # Later: wait out the snooze, then ask again if it's still waiting for you
+        until = time.time() + LATER_MIN * 60
+        while time.time() < until:
+            time.sleep(5)
+            if not pending(args.id)[0]:
+                return
+
+
+def cmd_test(args):
+    with Store() as st:
+        cur = st.current(args.id)
+    if not cur.get("test_cmd"):
+        fail("this request has no test command")
+    print(f"$ {cur['test_cmd']}  (in {cur['root']})", flush=True)
+    sys.exit(subprocess.run(cur["test_cmd"], shell=True, cwd=cur["root"]).returncode)
+
+
+def cmd_pause(args):
+    seconds = parse_duration(args.duration)
+    with Store() as st:
+        st.state["paused_until"] = st.now + seconds
+    print(f"Paused for {fmt_min(seconds)}.")
+
+
+def cmd_off(args):
+    with Store() as st:
+        st.state["off"] = True
+    print("Hand-code off. Agents won't ask until `handcode on`.")
+
+
+def cmd_on(args):
+    with Store() as st:
+        st.state["off"] = False
+        st.state["paused_until"] = None
+    print("Hand-code on.")
+
+
+def cmd_reset(args):
+    with Store() as st:
+        st.state["last_ended_at"] = None
+        st.state["paused_until"] = None
+        st.state["off"] = False
+    print("Cooldown cleared: the next agent with a good candidate may ask you now.")
+
+
+def cmd_stats(args):
+    if not HISTORY.exists():
+        print("No requests yet.")
+        return
+    reqs = {}
+    for line in HISTORY.read_text().splitlines():
+        entry = json.loads(line)
+        reqs.setdefault(entry["id"], {}).update({k: v for k, v in entry.items() if v is not None})
+    items = list(reqs.values())
+    counts = {}
+    for r in items:
+        counts[r.get("status", "?")] = counts.get(r.get("status", "?"), 0) + 1
+    passed = sum(1 for r in items if r.get("result") == "pass")
+    durations = [(r["ended_at"] - r["accepted_at"]) / 60 for r in items
+                 if r.get("status") == "done" and r.get("accepted_at") and r.get("ended_at")]
+    print(f"{len(items)} requests · " + " · ".join(f"{n} {s}" for s, n in sorted(counts.items())))
+    print(f"your code passed its tests: {passed}")
+    if durations:
+        print(f"median time to done: {statistics.median(durations):.0f} min")
+    print("\nrecent:")
+    for r in items[-args.recent:]:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.get("posted_at") or r.get("ended_at") or 0))
+        result = f" ({r['result']})" if r.get("result") else ""
+        reason = f" — {r['reason']}" if r.get("reason") else ""
+        print(f"  {when}  {r.get('status', '?'):<9} {r.get('symbol') or r.get('title')}"
+              f"  [{r.get('project', '')}]{result}{reason}")
+
+
+def cmd_hook(args):
+    """UserPromptSubmit hook: one line of context while a slot is open, otherwise nothing."""
+    try:
+        if os.environ.get("HAND_CODE_DISABLE"):
+            return
+        if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+            return  # headless runs (claude -p, SDK) have nobody to ask
+        with Store() as st:
+            is_open, _, _ = st.availability()
+        if is_open:
+            print("hand-code: a slot is open. If this task has you writing a self-contained function "
+                  "with real logic, invoke the hand-code skill before implementing it.")
+    except Exception:
+        pass
+
+
+def main():
+    p = argparse.ArgumentParser(prog="handcode", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help_text, id_arg=None):
+        sp = sub.add_parser(name, help=help_text)
+        sp.set_defaults(fn=fn)
+        if id_arg == "required":
+            sp.add_argument("id")
+        elif id_arg == "optional":
+            sp.add_argument("id", nargs="?")
+        return sp
+
+    add("check", cmd_check, "is a slot open? (agent)")
+    sp = add("claim", cmd_claim, "reserve the slot (agent)")
+    sp.add_argument("--title", required=True)
+    sp.add_argument("--force", action="store_true", help="ignore cooldown/pause; for user-requested tasks")
+    sp = add("post", cmd_post, "publish a claimed request and notify the user (agent)", "required")
+    sp.add_argument("--file", required=True)
+    sp.add_argument("--symbol", required=True)
+    sp.add_argument("--summary", required=True)
+    sp.add_argument("--test-cmd")
+    sp.add_argument("--estimate", type=int, help="minutes")
+    sp = add("wait", cmd_wait, "block until the request resolves; prints JSON (agent)", "required")
+    sp.add_argument("--poll", type=float, default=5)
+    sp = add("reopen", cmd_reopen, "hand a done request back after failing tests (agent)", "required")
+    sp.add_argument("--reason", required=True)
+    sp = add("close", cmd_close, "record the final result (agent)", "required")
+    sp.add_argument("--result", required=True, choices=["pass", "fixed", "agent", "none"])
+    add("release", cmd_release, "give the slot back without asking (agent)", "required")
+    sp = add("decline", cmd_decline, "record a candidate you passed on, and why (agent)")
+    sp.add_argument("--title", required=True)
+    sp.add_argument("--reason", required=True)
+
+    add("status", cmd_status, "what's going on")
+    sp = add("show", cmd_show, "print the current brief", "optional")
+    sp.add_argument("--lines", type=int, default=40)
+    add("open", cmd_open, "open the stub in your editor", "optional")
+    add("accept", cmd_accept, "take the current request", "optional")
+    add("skip", cmd_skip, "pass; the agent writes it", "optional")
+    add("done", cmd_done, "mark finished (same as deleting the HAND-CODE line)", "optional")
+    sp = add("extend", cmd_extend, "add minutes to the current window")
+    sp.add_argument("minutes", type=float)
+    sp.add_argument("id", nargs="?")
+    add("test", cmd_test, "run the request's tests", "optional")
+    add("dialog", cmd_dialog, "show the Take it / Skip / Later pop-up for a pending request", "required")
+    sp = add("pause", cmd_pause, "no requests for a while, e.g. `pause 2h`")
+    sp.add_argument("duration")
+    add("off", cmd_off, "no requests until `on`")
+    add("on", cmd_on, "resume requests")
+    add("reset", cmd_reset, "clear the cooldown and any pause, so a request can come now")
+    sp = add("stats", cmd_stats, "history")
+    sp.add_argument("--recent", type=int, default=8)
+    add("hook", cmd_hook, "UserPromptSubmit hook output")
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
