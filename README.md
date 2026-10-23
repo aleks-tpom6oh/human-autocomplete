@@ -10,19 +10,9 @@ You get a signature, a short brief and failing tests. You have 20 minutes to pic
 
 A pop-up that stays on screen until you answer it:
 
-```
-✋ Hand-code
-
-Your turn: parseRetryAfter · ~20 min
-
-Retry-After header → delay in ms
-
-retryAfter.ts:12 in webhooks
-
-Pick it up within 20 min, or the agent writes it.
-
-              [ Skip ]  [ Later (+10 min) ]  [ Take it ]
-```
+<p align="center">
+  <img src="assets/popup.png" width="436" alt="The hand-code pop-up: “Your turn: totals_per_span · ~15 min. Move the pointer from blocks to spans so a long block can't stall it. store.py:222 in time-tracker. Pick it up within 20 min, or the agent writes it.” Buttons: Skip, Later (+10 min), Take it.">
+</p>
 
 **Take it** opens your editor on a stub whose doc comment is the problem statement:
 
@@ -64,6 +54,22 @@ When you're finished, delete the `HAND-CODE` line. The agent then runs the tests
 - **They fail again.** It makes the smallest fix itself and shows you exactly what it changed.
 
 You can ask for hints along the way. The agent answers like an interviewer: it clarifies the contract and nudges, but doesn't write the code for you.
+
+## A real one
+
+This one came from building the history screen of a time tracker. The function splits time-sorted activity blocks into per-day totals for each tag, clipping any block that crosses midnight, all in one pass. It started as a stub with 13 failing tests and ended as this. The body was written by hand, with the agent answering questions and giving hints; the docstring is the brief, tidied up by the agent afterwards.
+
+<p align="center">
+  <img src="assets/real-result.png" width="640" alt="The finished totals_per_span function in an editor: a docstring explaining the one-pass approach, then two while loops over blocks with a persistent index and an inner index, clipping each block to the span and adding its seconds under the tag name.">
+</p>
+
+It keeps time, too:
+
+<p align="center">
+  <img src="assets/how-long.png" width="720" alt="Asking the agent “did it take me an hour to do the first snippet?” It answers: more than an hour, about 1h24m. Accepted at 16:29, done at 17:53, 84.4 minutes against an estimate of about 25. That window covered a nested-loop version that went green, a one-pass rewrite with two indexes, and review tweaks.">
+</p>
+
+Estimate: 25 minutes. Actual: 84. That's the fun part.
 
 ## Why it doesn't get annoying
 
