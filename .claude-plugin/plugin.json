@@ -1,13 +1,13 @@
 {
-  "name": "hand-code",
+  "name": "human-autocomplete",
   "version": "0.1.0",
-  "description": "Now and then, your agent hands you one real function from the task at hand to write yourself: signature, brief, failing tests. Pick it up within 20 minutes or it writes it for you.",
+  "description": "Your agent writes the signature and the failing tests; you get to finish the function. Now and then it hands you one real function from the task at hand, and writes it itself if you don't pick it up within 20 minutes.",
   "author": {
     "name": "Alexey Verein",
     "url": "https://github.com/aleks-tpom6oh"
   },
-  "homepage": "https://github.com/aleks-tpom6oh/hand-code",
-  "repository": "https://github.com/aleks-tpom6oh/hand-code",
+  "homepage": "https://github.com/aleks-tpom6oh/human-autocomplete",
+  "repository": "https://github.com/aleks-tpom6oh/human-autocomplete",
   "license": "MIT",
   "keywords": ["practice", "coding", "kata", "focus", "skills"],
   "hooks": {

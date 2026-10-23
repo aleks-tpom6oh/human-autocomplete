@@ -1,10 +1,12 @@
-# ✋ hand-code
+# ✋ human-autocomplete
 
-**Your agents write all the code now. hand-code gives you a little of it back.**
+**Your agent writes the signature and the failing tests. You get to finish the function.**
 
-Run a few Claude Code sessions in parallel and a week can go by without you writing a single function. hand-code fixes that without slowing anything down. Now and then, when an agent is about to write a self-contained piece of real logic, it hands that piece to you instead. You get it set up like a good interview problem, but it's code your project needs today, not a puzzle.
+Copilot used to autocomplete you. Now you get to autocomplete the agent.
 
-You get a signature, a short brief and failing tests. You have 20 minutes to pick it up. If you don't, the agent writes it and nobody waits.
+Run a few Claude Code sessions in parallel and a week can go by without you writing a single function. human-autocomplete fixes that without slowing anything down. Now and then, when an agent is about to write a self-contained piece of real logic, it hands that piece to you instead. You get it set up like a good interview problem, but it's code your project needs today, not a puzzle.
+
+You have 20 minutes to pick it up. If you don't, the agent writes it and nobody waits.
 
 ## What a request looks like
 
@@ -85,17 +87,19 @@ Estimate: 25 minutes. Actual: 84. That's the fun part.
 ### As a Claude Code plugin (recommended)
 
 ```
-/plugin marketplace add aleks-tpom6oh/hand-code
-/plugin install hand-code@hand-code
+/plugin marketplace add aleks-tpom6oh/human-autocomplete
+/plugin install human-autocomplete@human-autocomplete
 ```
 
 Then restart Claude Code. This installs the skill and a small `UserPromptSubmit` hook. The hook is what tells agents a slot is open.
 
+Inside the plugin, the skill, the `handcode` command and the `HAND-CODE` marker are all called "hand-code", after the action.
+
 ### By hand
 
 ```bash
-git clone https://github.com/aleks-tpom6oh/hand-code ~/src/hand-code
-ln -s ~/src/hand-code/skills/hand-code ~/.claude/skills/hand-code
+git clone https://github.com/aleks-tpom6oh/human-autocomplete ~/src/human-autocomplete
+ln -s ~/src/human-autocomplete/skills/hand-code ~/.claude/skills/hand-code
 ```
 
 Then add the hook to `~/.claude/settings.json`:
@@ -125,10 +129,10 @@ Then add the hook to `~/.claude/settings.json`:
 
   ```bash
   # by-hand install
-  ln -s ~/src/hand-code/skills/hand-code/scripts/handcode ~/.local/bin/handcode
+  ln -s ~/src/human-autocomplete/skills/hand-code/scripts/handcode ~/.local/bin/handcode
 
   # plugin install: add to ~/.zshrc or ~/.bashrc
-  handcode() { python3 "$(ls -dt ~/.claude/plugins/cache/hand-code/hand-code/*/ | head -1)skills/hand-code/scripts/handcode" "$@"; }
+  handcode() { python3 "$(ls -dt ~/.claude/plugins/cache/human-autocomplete/human-autocomplete/*/ | head -1)skills/hand-code/scripts/handcode" "$@"; }
   ```
 
 ## Using it

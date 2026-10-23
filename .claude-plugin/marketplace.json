@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "hand-code",
-  "description": "Get one real function a day back from your coding agents, to write by hand.",
+  "name": "human-autocomplete",
+  "description": "Your agent writes the signature and the failing tests. You get to finish the function.",
   "owner": {
     "name": "Alexey Verein",
     "url": "https://github.com/aleks-tpom6oh"
   },
   "plugins": [
     {
-      "name": "hand-code",
+      "name": "human-autocomplete",
       "description": "Your agent hands you one real, well-specified function to write yourself, at most once an hour. Never blocks: if you don't pick it up, it writes it.",
       "source": "./",
       "category": "productivity"
